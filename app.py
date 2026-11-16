@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
+import warnings
+from importlib.metadata import version
+from html import escape
+from sklearn.exceptions import InconsistentVersionWarning
 from pathlib import Path
 
 import joblib
@@ -53,6 +58,13 @@ div[data-testid="stFormSubmitButton"] button, .stButton button { border-radius:1
 .stButton button[kind="primary"], div[data-testid="stFormSubmitButton"] button { background:#254d3b; border-color:#254d3b; }
 div[data-testid="stSelectbox"] label { color:#344a3c; font-weight:600; }
 @media (max-width:700px) { .hero { padding:26px 22px; } .hero:after { right:2%; top:2%; font-size:75px; } .block-container { padding-left:1rem; padding-right:1rem; } }
+div[data-testid="stSelectbox"] [data-baseweb="select"] > div { background:#fffdf8; color:#20332b; }
+.stApp label, .stApp h3, .stApp h4 { color:#20332b; }
+@media (max-width:700px) {
+  div[data-testid="stHorizontalBlock"] { flex-wrap:wrap; }
+  div[data-testid="stColumn"] { width:100% !important; flex:1 1 100% !important; min-width:0; }
+  .result-card { min-height:0; }
+}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -95,7 +107,7 @@ VALUE_LABELS = {
     "bruises": {"t":"Có vết bầm", "f":"Không có vết bầm"},
     "odor": {"a":"Mùi hạnh nhân", "l":"Mùi hồi", "c":"Mùi creosote", "y":"Mùi tanh", "f":"Mùi hôi", "m":"Mùi mốc", "n":"Không mùi", "p":"Mùi hăng", "s":"Mùi cay"},
     "gill-attachment": {"a":"Gắn liền", "d":"Phiến chạy xuống cuống", "f":"Tách khỏi cuống", "n":"Có khía"},
-    "gill-spacing": {"c":"Phiến sít", "w":"Phiến dày", "d":"Phiến thưa"},
+    "gill-spacing": {"c":"Phiến sít", "w":"Phiến thưa", "d":"Phiến rất sít"},
     "gill-size": {"b":"Rộng", "n":"Hẹp"},
     "stalk-shape": {"e":"Phình ở dưới", "t":"Thuôn ở dưới"},
     "stalk-root": {"b":"Phình củ", "c":"Dạng chùy", "u":"Dạng cốc", "e":"Đều", "z":"Có rễ dạng sợi", "r":"Có rễ", "?":"Không rõ — dùng giá trị thay thế"},
@@ -143,15 +155,28 @@ def load_assets():
 
     with config_path.open(encoding="utf-8") as file:
         config = json.load(file)
-    preprocessing = joblib.load(preprocessing_path)
+    expected = config.get("scikit_learn")
+    if not expected or expected != version("scikit-learn"):
+        raise ValueError(
+            f"Phiên bản scikit-learn chưa khớp mô hình. "
+            f"Cần scikit-learn=={expected or 'phiên bản lúc huấn luyện'}, "
+            f"hiện tại là {version('scikit-learn')}. Cập nhật requirements.txt rồi triển khai lại."
+        )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", InconsistentVersionWarning)
+        preprocessing = joblib.load(preprocessing_path)
+    for key in ("cot_giu", "imputer", "onehot"):
+        if key not in preprocessing:
+            raise ValueError(f"tien_xu_ly.pkl thiếu thành phần {key}.")
+    columns = preprocessing["cot_giu"]
+    if not columns or len(set(columns)) != len(columns):
+        raise ValueError("Danh sách cột trong bộ tiền xử lý không hợp lệ.")
+    for column in columns:
+        if not config.get("gia_tri_nhap", {}).get(column):
+            raise ValueError(f"thong_tin.json thiếu lựa chọn cho cột {column}.")
 
-    # Compatibility for SimpleImputer pickles created before scikit-learn 1.8.
-    # Newer scikit-learn uses _fill_dtype when transforming its learned statistics.
-    # The dtype of statistics_ is the dtype learned from the training data.
-    imputer = preprocessing["imputer"]
-    if not hasattr(imputer, "_fill_dtype"):
-        imputer._fill_dtype = np.asarray(imputer.statistics_).dtype
-
+    if config.get("tensorflow") != tf.__version__:
+        raise ValueError(f"Cần tensorflow-cpu=={config.get('tensorflow')}; hiện tại là {tf.__version__}.")
     encoder = tf.keras.models.load_model(encoder_path, compile=False)
     models = {
         "A - KNN": joblib.load(MODEL_DIR / "A_KNN.pkl"),
@@ -159,6 +184,14 @@ def load_assets():
         "B - KNN": joblib.load(MODEL_DIR / "B_KNN.pkl"),
         "B - GaussianNB": joblib.load(MODEL_DIR / "B_GaussianNB.pkl"),
     }
+    if encoder.input_shape[-1] != config["so_chieu_onehot"] or encoder.output_shape[-1] != config["so_chieu_an"]:
+        raise ValueError("Số chiều Encoder không khớp thong_tin.json.")
+    for name, model in models.items():
+        expected_dim = config["so_chieu_onehot"] if name.startswith("A") else config["so_chieu_an"]
+        if model.n_features_in_ != expected_dim:
+            raise ValueError(f"{name}: số chiều không khớp cấu hình.")
+        if set(model.classes_) != {0, 1}:
+            raise ValueError(f"{name}: nhãn mô hình phải là 0 và 1.")
     return config, preprocessing, encoder, models
 
 
@@ -175,8 +208,6 @@ st.markdown(
       <div class="eyebrow">Dự án học máy · Đề tài 09</div>
       <h1>Nhận diện nấm<br>qua đặc điểm quan sát</h1>
       <p>Chọn các đặc trưng của mẫu nấm để xem bốn cấu hình mô hình dự đoán lớp Ăn được hoặc Độc. Có thể đối chiếu đặc trưng One-Hot với biểu diễn được học bằng Autoencoder.</p>
-      <span class="pill">🍃 Luồng A · One-Hot Encoding</span>
-      <span class="pill">🧠 Luồng B · Autoencoder</span>
     </section>
     """,
     unsafe_allow_html=True,
@@ -193,172 +224,158 @@ except Exception as error:
     )
     st.stop()
 
-feature_columns = preprocessing["cot_giu"]
-valid_values = config["gia_tri_nhap"]
 
-st.markdown('<div class="section-title">Thông tin đầu vào</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="section-sub">Chọn đặc điểm quan sát được. Mỗi lựa chọn hiển thị tên tiếng Việt và mã gốc để bạn dễ đối chiếu với bộ dữ liệu.</div>',
-    unsafe_allow_html=True,
-)
+def options_for(column):
+    values = list(dict.fromkeys(str(v) for v in config["gia_tri_nhap"][column]))
+    if column == "stalk-root" and "?" not in values:
+        values.append("?")
+    return values
+
+
+def clear_prediction():
+    st.session_state.pop("latest_predictions", None)
+    st.session_state.pop("prediction_input", None)
+
+
+def predict_values(values, preprocessing, encoder, models):
+    """Chỉ transform/predict bằng tài nguyên đã lưu; không fit lại."""
+    columns = preprocessing["cot_giu"]
+    row = pd.DataFrame([{c: np.nan if values[c] == "?" else values[c]
+                         for c in columns}], columns=columns)
+    features_a = preprocessing["onehot"].transform(
+        preprocessing["imputer"].transform(row))
+    if hasattr(features_a, "toarray"):
+        features_a = features_a.toarray()
+    features_b = encoder.predict(features_a, verbose=0)
+    if not np.isfinite(features_a).all() or not np.isfinite(features_b).all():
+        raise ValueError("Đặc trưng sau xử lý chứa giá trị không hợp lệ.")
+    features = {"A": features_a, "B": features_b}
+    rows = []
+    for name, model in models.items():
+        data = features[name.split(" - ")[0]]
+        pred = int(model.predict(data)[0])
+        pos = list(model.classes_).index(1)
+        probability = float(model.predict_proba(data)[0, pos])
+        if pred not in (0, 1) or not np.isfinite(probability) or not 0 <= probability <= 1:
+            raise ValueError(f"Kết quả của {name} không hợp lệ.")
+        rows.append({"Mô hình": name, "Dự đoán": "Độc" if pred == 1 else "Ăn được",
+                     "Xác suất lớp Độc": probability})
+    return rows
+
+
+feature_columns = preprocessing["cot_giu"]
+st.success("Đã sẵn sàng · Nạp đủ bộ tiền xử lý, Encoder và 4 mô hình")
+flow_filter = st.radio(
+    "Chọn luồng kết quả", ["all", "A", "B"], horizontal=True, key="flow_filter",
+    format_func=lambda x: {"all": "So sánh cả hai luồng", "A": "Luồng A · One-Hot",
+                           "B": "Luồng B · Autoencoder"}[x])
+st.caption("Luồng A dùng đặc trưng One-Hot. Luồng B dùng đặc trưng nén qua Encoder.")
+
+st.markdown('<div class="section-title">Đặc điểm mẫu nấm</div>', unsafe_allow_html=True)
+st.caption("1. Nhập đặc điểm hoặc nạp mẫu → 2. Bấm Dự đoán → 3. Đối chiếu kết quả")
 
 with st.container(border=True):
-    top_left, top_right = st.columns([1.25, 1])
-    with top_left:
-        st.markdown("**Mẫu minh họa**")
-        st.caption("Có thể nạp ngẫu nhiên một dòng từ mushrooms.csv để thử nhanh.")
-    with top_right:
-        if st.button("🎲 Nạp mẫu minh họa", use_container_width=True):
+    if st.button("🎲 Nạp mẫu minh họa", width="stretch"):
+        try:
             demo_data = load_demo_data()
-            if demo_data is None:
-                st.warning("Không tìm thấy mushrooms.csv ở thư mục gốc repository.")
-            else:
-                sample = demo_data.sample(n=1).iloc[0]
-                sample_values = {}
-                for column in feature_columns:
-                    raw_value = str(sample[column])
-                    if raw_value not in [str(v) for v in valid_values[column]]:
-                        raw_value = str(valid_values[column][0])
-                    widget_key = f"mushroom_{column}"
-                    st.session_state[widget_key] = raw_value
-                    sample_values[column] = raw_value
-                st.session_state["demo_sample"] = {
-                    "values": sample_values,
-                    "label": str(sample["class"]),
-                }
-                st.session_state.pop("latest_predictions", None)
-                st.rerun()
-
-    st.markdown("---")
+            if demo_data is None or demo_data.empty:
+                raise ValueError("Cần tệp mushrooms.csv cùng cấp app.py để nạp mẫu.")
+            missing = set(feature_columns + ["class"]) - set(demo_data.columns)
+            if missing:
+                raise ValueError("Dữ liệu minh họa thiếu cột: " + ", ".join(sorted(missing)))
+            sample = demo_data.sample(n=1).iloc[0]
+            values = {c: "?" if pd.isna(sample[c]) else str(sample[c]) for c in feature_columns}
+            for c, value in values.items():
+                if value not in options_for(c):
+                    raise ValueError(f"Mẫu chứa giá trị chưa hỗ trợ: {c}={value}. Không tự thay thế mẫu.")
+            for c, value in values.items():
+                st.session_state[f"mushroom_{c}"] = value
+            st.session_state["demo_sample"] = {"values": values, "label": str(sample["class"])}
+            clear_prediction()
+        except Exception as error:
+            st.warning(str(error))
+    st.caption("Mẫu lấy từ mushrooms.csv, có thể thuộc dữ liệu huấn luyện; chỉ dùng minh họa.")
     groups = [
-        ("🍄 Mũ nấm", ["cap-shape", "cap-surface", "cap-color", "bruises", "odor"]),
+        ("🍄 Mũ và mùi", ["cap-shape", "cap-surface", "cap-color", "bruises", "odor"]),
         ("🌿 Phiến nấm", ["gill-attachment", "gill-spacing", "gill-size", "gill-color"]),
         ("🪵 Cuống nấm", ["stalk-shape", "stalk-root", "stalk-surface-above-ring", "stalk-surface-below-ring", "stalk-color-above-ring", "stalk-color-below-ring"]),
         ("⭕ Màng và vòng", ["veil-color", "ring-number", "ring-type"]),
         ("🌲 Bào tử và môi trường", ["spore-print-color", "population", "habitat"]),
     ]
+    grouped = {c for _, cols in groups for c in cols}
+    extra = [c for c in feature_columns if c not in grouped]
+    if extra:
+        groups.append(("Đặc điểm bổ sung", extra))
+    current_values = {}
+    for title, columns in groups:
+        present = [c for c in columns if c in feature_columns]
+        if not present:
+            continue
+        st.markdown(f"#### {title}")
+        grid = st.columns(3)
+        for i, c in enumerate(present):
+            options = options_for(c)
+            key = f"mushroom_{c}"
+            if st.session_state.get(key) not in options:
+                st.session_state[key] = options[0]
+            with grid[i % 3]:
+                current_values[c] = st.selectbox(
+                    FEATURE_LABELS.get(c, c), options,
+                    format_func=lambda v, c=c: display_value(c, v),
+                    key=key, on_change=clear_prediction)
 
-    submitted = False
-    with st.form("mushroom-input-form"):
-        input_values = {}
-        for group_title, group_columns in groups:
-            present_columns = [c for c in group_columns if c in feature_columns]
-            if not present_columns:
-                continue
-            st.markdown(f"#### {group_title}")
-            columns = st.columns(3)
-            for index, column in enumerate(present_columns):
-                options = [str(value) for value in valid_values[column]]
-                if column == "stalk-root" and "?" not in options:
-                    options.append("?")
-                key = f"mushroom_{column}"
-                if key not in st.session_state or st.session_state[key] not in options:
-                    st.session_state[key] = options[0]
-                with columns[index % 3]:
-                    st.selectbox(
-                        FEATURE_LABELS.get(column, column),
-                        options=options,
-                        format_func=lambda value, c=column: display_value(c, value),
-                        key=key,
-                    )
-                input_values[column] = None
-        st.markdown(" ")
-        submitted = st.form_submit_button(
-            "✨ Dự đoán với các mô hình",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if submitted:
-        row_values = {
-            column: (np.nan if st.session_state[f"mushroom_{column}"] == "?"
-                     else str(st.session_state[f"mushroom_{column}"]))
-            for column in feature_columns
-        }
-        row = pd.DataFrame([row_values], columns=feature_columns)
+    sample_info = st.session_state.get("demo_sample")
+    if sample_info:
+        if sample_info["values"] == current_values:
+            label = {"p": "Độc", "e": "Ăn được"}.get(sample_info["label"], "Không xác định")
+            st.info(f"Nhãn gốc của mẫu: **{label}** — chỉ để đối chiếu, không đưa vào mô hình.")
+        else:
+            st.caption("Đã sửa đầu vào. Nhãn của mẫu minh họa không còn áp dụng.")
+    if st.button("✨ Dự đoán với các mô hình", type="primary", width="stretch"):
+        clear_prediction()
         try:
-            filled = preprocessing["imputer"].transform(row)
-            features_a = preprocessing["onehot"].transform(filled)
-            features_b = encoder.predict(features_a, verbose=0)
-            feature_data = {"A": features_a, "B": features_b}
-            output_rows = []
-
-            for model_name, model in models.items():
-                stream = model_name.split(" - ", 1)[0]
-                model_input = feature_data[stream]
-                prediction = int(model.predict(model_input)[0])
-                class_position = list(model.classes_).index(1)
-                poison_probability = float(model.predict_proba(model_input)[0, class_position])
-                output_rows.append({
-                    "Mô hình": model_name,
-                    "Dự đoán": "Độc" if prediction == 1 else "Ăn được",
-                    "Xác suất lớp Độc": poison_probability,
-                })
-
-            st.session_state["latest_predictions"] = output_rows
-            sample_info = st.session_state.get("demo_sample")
-            current_values = {c: st.session_state[f"mushroom_{c}"] for c in feature_columns}
-            same_as_sample = bool(
-                sample_info
-                and all(current_values[c] == sample_info["values"].get(c) for c in feature_columns)
-            )
-            st.session_state["sample_is_current"] = same_as_sample
+            with st.spinner("Đang phân tích đặc điểm hiện tại…"):
+                rows = predict_values(current_values, preprocessing, encoder, models)
+            st.session_state["latest_predictions"] = rows
+            st.session_state["prediction_input"] = current_values.copy()
         except Exception as error:
-            st.error(f"Không thể dự đoán: {error}")
+            logging.exception("Prediction failed")
+            st.error("Không thể dự đoán. Kiểm tra tính tương thích của thư viện và các tệp mô hình.")
+            with st.expander("Chi tiết lỗi để kiểm tra"):
+                st.code(str(error), language=None)
 
-
-predictions = st.session_state.get("latest_predictions")
+if st.session_state.get("prediction_input") != current_values:
+    clear_prediction()
+all_predictions = st.session_state.get("latest_predictions", [])
+predictions = [p for p in all_predictions
+               if flow_filter == "all" or p["Mô hình"].startswith(flow_filter + " - ")]
 if predictions:
-    st.markdown('<div class="section-title">Kết quả dự đoán</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="section-sub">Kết quả được tính lại khi bạn bấm nút dự đoán. Nếu thay đổi lựa chọn, hãy bấm nút một lần nữa để cập nhật.</div>',
-        unsafe_allow_html=True,
-    )
-
-    current_sample = st.session_state.get("demo_sample")
-    if current_sample and st.session_state.get("sample_is_current"):
-        actual = "Độc" if current_sample["label"] == "p" else "Ăn được"
-        st.info(f"Mẫu minh họa có nhãn trong dữ liệu là **{actual}**. Nhãn này chỉ dùng đối chiếu khi đầu vào vẫn giữ nguyên như mẫu vừa nạp.")
-    elif current_sample:
-        st.caption("Bạn đã chỉnh đầu vào sau khi nạp mẫu; nhãn gốc của mẫu không còn được dùng để đối chiếu.")
-
-    best_display = predictions[0]
-    if all(item["Dự đoán"] == predictions[0]["Dự đoán"] for item in predictions):
-        agreement_text = "Cả bốn mô hình đang dự đoán cùng một lớp."
+    st.markdown('<div class="section-title">Kết quả cho đầu vào hiện tại</div>', unsafe_allow_html=True)
+    labels = {p["Dự đoán"] for p in predictions}
+    if len(labels) == 1:
+        summary = f"{len(predictions)} mô hình đang hiển thị cùng dự đoán: {predictions[0]['Dự đoán']}"
     else:
-        agreement_text = "Các mô hình chưa thống nhất; hãy xem bảng so sánh bên dưới."
-    accent = "#a63835" if best_display["Dự đoán"] == "Độc" else "#276342"
-    st.markdown(
-        f"""<div class="panel" style="margin:8px 0 16px;border-left:5px solid {accent};">
-        <div class="result-label">Tóm tắt</div>
-        <div class="result-class" style="color:{accent};">{best_display['Dự đoán']}</div>
-        <div class="result-meta">{agreement_text}</div></div>""",
-        unsafe_allow_html=True,
-    )
-
-    cols = st.columns(4)
-    for column, result in zip(cols, predictions):
+        summary = "Các mô hình chưa thống nhất — xem kết quả từng mô hình bên dưới."
+    st.info(summary)
+    cols = st.columns(2)
+    for i, result in enumerate(predictions):
         color = "#a63835" if result["Dự đoán"] == "Độc" else "#276342"
-        with column:
-            st.markdown(
-                f"""<div class="result-card">
-                <div class="result-label">{result['Mô hình']}</div>
-                <div class="result-class" style="color:{color};">{result['Dự đoán']}</div>
-                <div class="result-meta">Xác suất lớp Độc<br><b>{result['Xác suất lớp Độc']:.1%}</b></div>
-                </div>""",
-                unsafe_allow_html=True,
-            )
-
+        with cols[i % 2]:
+            st.markdown(f"""<div class="result-card" style="margin-bottom:14px; border-top:4px solid {color}">
+                <div class="result-label">{escape(result['Mô hình'])}</div>
+                <div class="result-class" style="color:{color}">{result['Dự đoán']}</div>
+                <div class="result-meta">Xác suất lớp Độc theo mô hình<br>
+                <b>{result['Xác suất lớp Độc']:.2%}</b></div></div>""", unsafe_allow_html=True)
     comparison = pd.DataFrame(predictions)
-    comparison["Xác suất lớp Độc"] = comparison["Xác suất lớp Độc"].map(lambda value: f"{value:.2%}")
-    st.markdown("#### Bảng đối chiếu bốn cấu hình")
-    st.dataframe(comparison, hide_index=True, use_container_width=True)
+    st.dataframe(comparison.style.format({"Xác suất lớp Độc": "{:.2%}"}),
+                 hide_index=True, width="stretch")
+    st.caption("Xác suất là đầu ra của mô hình, không phải mức bảo đảm an toàn.")
+    with st.expander("Xem đặc điểm đã dùng để dự đoán"):
+        st.dataframe(pd.DataFrame([
+            {"Thuộc tính": FEATURE_LABELS.get(c, c), "Giá trị": display_value(c, current_values[c])}
+            for c in feature_columns]), hide_index=True, width="stretch")
+else:
+    st.info("Chọn đặc điểm rồi bấm Dự đoán. Khi sửa đầu vào, kết quả cũ sẽ được xóa.")
 
-st.markdown(
-    '<div class="safe-note"><b>Lưu ý:</b> Đây là sản phẩm học tập để minh họa mô hình phân loại trên bộ dữ liệu. Không dùng dự đoán này để xác định nấm ngoài thực tế có an toàn để ăn hay không.</div>',
-    unsafe_allow_html=True,
-)
-st.markdown(
-    '<div class="footer-note">Đề tài 09 · Phân loại nấm · Luồng A: One-Hot Encoding · Luồng B: Autoencoder</div>',
-    unsafe_allow_html=True,
-)
+st.markdown('<div class="safe-note"><b>Demo học tập:</b> Không dùng kết quả để quyết định ăn nấm ngoài thực tế.</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer-note">Đề tài 09 · Phân loại nấm · KNN & Gaussian Naive Bayes</div>', unsafe_allow_html=True)
