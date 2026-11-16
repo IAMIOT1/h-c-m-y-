@@ -144,6 +144,14 @@ def load_assets():
     with config_path.open(encoding="utf-8") as file:
         config = json.load(file)
     preprocessing = joblib.load(preprocessing_path)
+
+    # Compatibility for SimpleImputer pickles created before scikit-learn 1.8.
+    # Newer scikit-learn uses _fill_dtype when transforming its learned statistics.
+    # The dtype of statistics_ is the dtype learned from the training data.
+    imputer = preprocessing["imputer"]
+    if not hasattr(imputer, "_fill_dtype"):
+        imputer._fill_dtype = np.asarray(imputer.statistics_).dtype
+
     encoder = tf.keras.models.load_model(encoder_path, compile=False)
     models = {
         "A - KNN": joblib.load(MODEL_DIR / "A_KNN.pkl"),
