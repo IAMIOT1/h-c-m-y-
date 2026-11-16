@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import io
+import hashlib
+from PIL import Image, ImageOps, UnidentifiedImageError
 import logging
 import warnings
 from importlib.metadata import version
@@ -213,6 +216,121 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+
+def decode_photo(raw):
+    """Decode only supported still images; keep original resolution for inference."""
+    if not raw or len(raw) > 10 * 1024 * 1024:
+        raise ValueError("Ảnh phải có dung lượng tối đa 10 MB.")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        with Image.open(io.BytesIO(raw)) as photo:
+            if photo.format not in {"JPEG", "PNG", "WEBP"}:
+                raise ValueError("Vui lòng chọn ảnh JPG, PNG hoặc WebP.")
+            if photo.width * photo.height > 20_000_000:
+                raise ValueError("Ảnh quá lớn. Vui lòng giảm xuống dưới 20 megapixel.")
+            photo.load()
+            return ImageOps.exif_transpose(photo).convert("RGB")
+
+
+@st.cache_resource(show_spinner="Đang nạp mô hình ảnh…")
+def load_image_model(model_stamp, config_stamp):
+    # Contract for a separately TRAINED image model; never use encoder.keras here.
+    # image_config.json:
+    # {"class_names":["e","p"], "input_size":[224,224],
+    #  "preprocessing_in_model":true, "resize":"bilinear_stretch",
+    #  "input_range":"0_255", "output":"softmax"}
+    # Exported model must include its training-time normalization layers.
+    folder = ROOT / "mo_hinh_anh"
+    cfg = json.loads((folder / "image_config.json").read_text(encoding="utf-8"))
+    names = cfg.get("class_names", [])
+    size = cfg.get("input_size", [])
+    if len(names) != 2 or set(names) != {"e", "p"}:
+        raise ValueError("Cấu hình mô hình ảnh phải xác định đúng thứ tự hai lớp e và p.")
+    if len(size) != 2 or any(type(n) is not int or not 16 <= n <= 1024 for n in size):
+        raise ValueError("Kích thước đầu vào mô hình ảnh không hợp lệ.")
+    if (cfg.get("preprocessing_in_model") is not True or cfg.get("input_range") != "0_255"
+        or cfg.get("resize") != "bilinear_stretch" or cfg.get("output") != "softmax"):
+        raise ValueError("Quy trình xử lý ảnh chưa tương thích với ứng dụng. Cần đối chiếu cách huấn luyện.")
+    model = tf.keras.models.load_model(folder / "image_model.keras", compile=False)
+    if model.input_shape != (None, size[0], size[1], 3) or model.output_shape != (None, 2):
+        raise ValueError("Kiến trúc mô hình ảnh không khớp cấu hình.")
+    return model, cfg
+
+
+def predict_photo(photo, model, cfg):
+    pixels = tf.image.resize(np.asarray(photo, dtype=np.float32), cfg["input_size"],
+                             method="bilinear", antialias=False)
+    probabilities = np.asarray(model(pixels[None, ...], training=False))[0]
+    if (probabilities.shape != (2,) or not np.isfinite(probabilities).all()
+        or (probabilities < 0).any() or (probabilities > 1).any()
+        or not np.isclose(probabilities.sum(), 1, atol=1e-4)):
+        raise ValueError("Đầu ra mô hình ảnh không phải xác suất hợp lệ.")
+    return cfg["class_names"][int(np.argmax(probabilities))], float(probabilities[cfg["class_names"].index("p")])
+
+
+mode = st.radio("Cách sử dụng", ["Thuộc tính + ảnh minh họa", "Phân loại trực tiếp từ ảnh"],
+                horizontal=True, key="prediction_mode")
+with st.container(border=True):
+    st.markdown("### 📷 Ảnh mẫu nấm")
+    source = st.radio("Nguồn ảnh", ["Tải ảnh lên", "Chụp bằng camera"],
+                      horizontal=True, key="photo_source")
+    if source == "Tải ảnh lên":
+        uploaded_photo = st.file_uploader("Chọn ảnh JPG, PNG hoặc WebP · tối đa 10 MB",
+                                         type=["jpg", "jpeg", "png", "webp"], key="uploaded_photo")
+    else:
+        st.caption("Cho phép trình duyệt truy cập camera. Nếu không có camera, hãy chọn Tải ảnh lên.")
+        uploaded_photo = st.camera_input("Chụp mẫu nấm", key="captured_photo")
+    photo = None
+    photo_id = None
+    if uploaded_photo is not None:
+        try:
+            raw = uploaded_photo.getvalue()
+            photo = decode_photo(raw)
+            photo_id = hashlib.sha256(raw).hexdigest()
+            preview = photo.copy()
+            preview.thumbnail((1000, 700))
+            st.image(preview, caption="Ảnh đang chọn", width="content")
+        except (ValueError, OSError, UnidentifiedImageError,
+                Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
+            st.error(f"Không đọc được ảnh: {error}")
+    st.caption("Ảnh được gửi đến máy chủ để hiển thị/xử lý. Ứng dụng không ghi ảnh vào tệp hoặc GitHub.")
+
+if st.session_state.get("photo_identity") != (photo_id, source, mode):
+    st.session_state.pop("photo_prediction", None)
+    st.session_state.pop("latest_predictions", None)
+    st.session_state.pop("prediction_input", None)
+    st.session_state["photo_identity"] = (photo_id, source, mode)
+
+if mode == "Phân loại trực tiếp từ ảnh":
+    folder = ROOT / "mo_hinh_anh"
+    image_path = folder / "image_model.keras"
+    config_path = folder / "image_config.json"
+    ready = image_path.is_file() and config_path.is_file()
+    if not ready:
+        st.info("Chưa có mô hình phân loại ảnh. Cần huấn luyện mô hình bằng ảnh có nhãn trước khi sử dụng chế độ này.")
+        st.caption("Các mô hình KNN, GaussianNB và Encoder hiện tại chỉ xử lý thuộc tính dạng bảng.")
+    if st.button("🔎 Phân tích ảnh", type="primary", width="stretch", disabled=not ready or photo is None):
+        st.session_state.pop("photo_prediction", None)
+        try:
+            image_model, image_cfg = load_image_model(image_path.stat().st_mtime_ns, config_path.stat().st_mtime_ns)
+            with st.spinner("Đang phân tích ảnh…"):
+                st.session_state["photo_prediction"] = predict_photo(photo, image_model, image_cfg)
+        except Exception as error:
+            logging.exception("Image inference failed")
+            st.error("Không thể phân tích ảnh. Cần kiểm tra mô hình ảnh và cấu hình tiền xử lý.")
+            with st.expander("Chi tiết lỗi"):
+                st.code(str(error), language=None)
+    if "photo_prediction" in st.session_state:
+        label, probability = st.session_state["photo_prediction"]
+        st.markdown("### Kết quả từ mô hình ảnh")
+        st.write("Lớp dự đoán: **" + {"e": "Ăn được", "p": "Độc"}[label] + "**")
+        st.write(f"Xác suất lớp Độc theo mô hình: **{probability:.2%}**")
+    st.warning("Demo học tập. Không dùng ảnh hoặc kết quả này để quyết định ăn nấm ngoài thực tế.")
+    st.stop()
+
+st.caption("Ảnh chỉ hỗ trợ quan sát. Kết quả bên dưới được tính từ các thuộc tính bạn nhập; ảnh không tự điền thuộc tính.")
+
 try:
     config, preprocessing, encoder, models = load_assets()
 except Exception as error:
@@ -294,7 +412,7 @@ with st.container(border=True):
             clear_prediction()
         except Exception as error:
             st.warning(str(error))
-    st.caption("Mẫu lấy từ mushrooms.csv, có thể thuộc dữ liệu huấn luyện; chỉ dùng minh họa.")
+    st.caption("Mẫu lấy từ mushrooms.csv, có thể thuộc dữ liệu huấn luyện; không liên quan đến ảnh bạn tải lên.")
     groups = [
         ("🍄 Mũ và mùi", ["cap-shape", "cap-surface", "cap-color", "bruises", "odor"]),
         ("🌿 Phiến nấm", ["gill-attachment", "gill-spacing", "gill-size", "gill-color"]),
@@ -350,7 +468,7 @@ all_predictions = st.session_state.get("latest_predictions", [])
 predictions = [p for p in all_predictions
                if flow_filter == "all" or p["Mô hình"].startswith(flow_filter + " - ")]
 if predictions:
-    st.markdown('<div class="section-title">Kết quả cho đầu vào hiện tại</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Kết quả từ các thuộc tính đã nhập</div>', unsafe_allow_html=True)
     labels = {p["Dự đoán"] for p in predictions}
     if len(labels) == 1:
         summary = f"{len(predictions)} mô hình đang hiển thị cùng dự đoán: {predictions[0]['Dự đoán']}"
